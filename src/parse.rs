@@ -112,7 +112,6 @@ pub enum AnyNum {
 pub struct Bytes<'a> {
     /// Bits set according to the [`Extensions`] enum.
     pub exts: Extensions,
-    // bytes: &'a [u8],
     string: &'a str,
     cursor: Position,
 }
@@ -128,9 +127,6 @@ pub(crate) type LargeSInt = i64;
 
 impl<'a> Bytes<'a> {
     pub fn new(bytes: &'a [u8]) -> SpannedResult<Self> {
-        // // Verify that input is valid utf-8
-        // str::from_utf8(bytes).map_err(|error| SpannedError::from_utf8_error(error, bytes))?;
-
         let mut b = Bytes {
             exts: Extensions::empty(),
             string: str::from_utf8(bytes)
@@ -216,7 +212,7 @@ impl<'a> Bytes<'a> {
             let _ = self.advance(2);
         }
 
-        let num_bytes = self.next_bytes_contained_in(is_int_char);
+        let num_bytes = self.next_bytes_while(is_int_char);
 
         if num_bytes == 0 {
             return Err(Error::ExpectedInteger);
@@ -587,7 +583,7 @@ impl<'a> Bytes<'a> {
             }
         }
 
-        let num_bytes = self.next_bytes_contained_in(is_float_char);
+        let num_bytes = self.next_bytes_while(is_float_char);
 
         // Since `rustc` allows `1_0.0_1`, lint against underscores in floats
         if let Some(err_bytes) = self.bytes()[0..num_bytes].iter().position(|b| *b == b'_') {
@@ -608,7 +604,7 @@ impl<'a> Bytes<'a> {
         let next = self.peek_char_or_eof()?;
         if !is_ident_first_char(next) {
             if is_ident_raw_char(next) {
-                let ident_bytes = self.next_chars_contained_in(is_ident_raw_char);
+                let ident_bytes = self.next_chars_while(is_ident_raw_char);
                 return Err(Error::SuggestRawIdentifier(
                     self.string[..ident_bytes].into(),
                 ));
@@ -632,11 +628,11 @@ impl<'a> Bytes<'a> {
                     // skip "r#"
                     let _ = self.advance(2);
                     dbg!(&self);
-                    dbg!(self.next_chars_contained_in(is_ident_raw_char))
+                    dbg!(self.next_chars_while(is_ident_raw_char))
                 }
                 _ => {
-                    let std_ident_length = self.next_chars_contained_in(is_xid_continue);
-                    let raw_ident_length = self.next_chars_contained_in(is_ident_raw_char);
+                    let std_ident_length = self.next_chars_while(is_xid_continue);
+                    let raw_ident_length = self.next_chars_while(is_ident_raw_char);
 
                     if raw_ident_length > std_ident_length {
                         return Err(Error::SuggestRawIdentifier(
@@ -652,7 +648,7 @@ impl<'a> Bytes<'a> {
                 [self.string.chars().next().unwrap_or_default().len_utf8()..]
                 .find(|c| !is_xid_continue(c))
                 .unwrap_or(self.string.len() - 1);
-            let raw_ident_length = self.next_chars_contained_in(is_ident_raw_char);
+            let raw_ident_length = self.next_chars_while(is_ident_raw_char);
 
             if raw_ident_length > std_ident_length {
                 return Err(Error::SuggestRawIdentifier(
@@ -669,13 +665,25 @@ impl<'a> Bytes<'a> {
         Ok(ident)
     }
 
-    pub fn next_bytes_contained_in(&self, allowed: fn(u8) -> bool) -> usize {
-        self.bytes().iter().take_while(|&&b| allowed(b)).count()
+    pub fn next_bytes_while(&self, condition: fn(u8) -> bool) -> usize {
+        self.next_bytes_while_from(0, condition)
     }
 
-    pub fn next_chars_contained_in(&self, allowed: fn(char) -> bool) -> usize {
-        self.string
-            .find(|c| !allowed(c))
+    pub fn next_bytes_while_from(&self, from: usize, condition: fn(u8) -> bool) -> usize {
+        self.string[from..]
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| condition(b))
+            .count()
+    }
+
+    pub fn next_chars_while(&self, condition: fn(char) -> bool) -> usize {
+        self.next_chars_while_from(0, condition)
+    }
+
+    pub fn next_chars_while_from(&self, from: usize, condition: fn(char) -> bool) -> usize {
+        self.string[from..]
+            .find(|c| !condition(c))
             .unwrap_or(self.string.len())
     }
 
@@ -685,18 +693,8 @@ impl<'a> Bytes<'a> {
                 b'+' | b'-' => 1,
                 _ => 0,
             };
-            let flen = self
-                .bytes()
-                .iter()
-                .skip(skip)
-                .take_while(|&&b| is_float_char(b))
-                .count();
-            let ilen = self
-                .bytes()
-                .iter()
-                .skip(skip)
-                .take_while(|&&b| is_int_char(b))
-                .count();
+            let flen = self.next_bytes_while_from(skip, is_float_char);
+            let ilen = self.next_bytes_while_from(skip, is_int_char);
             flen > ilen
         } else {
             false
@@ -800,8 +798,9 @@ impl<'a> Bytes<'a> {
         }
     }
 
+    /// Parses after the `r`
     fn raw_string(&mut self) -> Result<ParsedStr<'a>> {
-        let num_hashes = self.bytes().iter().take_while(|&&b| b == b'#').count();
+        let num_hashes = self.next_bytes_while(|b| b == b'#');
         let hashes = &self.string[..num_hashes];
         let _ = self.advance(num_hashes);
 
@@ -908,7 +907,7 @@ impl<'a> Bytes<'a> {
         if self.consume("/") {
             match self.eat_byte()? {
                 b'/' => {
-                    let bytes = self.bytes().iter().take_while(|&&b| b != b'\n').count();
+                    let bytes = self.next_bytes_while(|b| b != b'\n');
 
                     let _ = self.advance(bytes);
                 }
@@ -916,11 +915,7 @@ impl<'a> Bytes<'a> {
                     let mut level = 1;
 
                     while level > 0 {
-                        let bytes = self
-                            .bytes()
-                            .iter()
-                            .take_while(|&&b| b != b'/' && b != b'*')
-                            .count();
+                        let bytes = self.next_bytes_while(|b| !matches!(b, b'/' | b'*'));
 
                         if self.string.is_empty() {
                             return Err(Error::UnclosedBlockComment);
