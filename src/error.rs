@@ -1,8 +1,14 @@
-use std::{error::Error as StdError, fmt, io, str::Utf8Error, string::FromUtf8Error};
+use std::{
+    error::Error as StdError,
+    fmt, io,
+    str::{self, Utf8Error},
+    string::FromUtf8Error,
+};
 
 use serde::{de, ser};
+use unicode_ident::is_xid_continue;
 
-use crate::parse::{is_ident_first_char, is_ident_other_char, is_ident_raw_char, BASE64_ENGINE};
+use crate::parse::{is_ident_first_char, is_ident_raw_char, BASE64_ENGINE};
 
 /// This type represents all possible errors that can occur when
 /// serializing or deserializing RON data.
@@ -57,7 +63,7 @@ pub enum Error {
 
     UnclosedBlockComment,
     UnderscoreAtBeginning,
-    UnexpectedByte(char),
+    UnexpectedChar(char),
 
     Utf8Error(Utf8Error),
     TrailingCharacters,
@@ -160,7 +166,7 @@ impl fmt::Display for Error {
             Error::UnderscoreAtBeginning => {
                 f.write_str("Unexpected leading underscore in an integer")
             }
-            Error::UnexpectedByte(ref byte) => write!(f, "Unexpected byte {:?}", byte),
+            Error::UnexpectedChar(c) => write!(f, "Unexpected char {:?}", c),
             Error::TrailingCharacters => f.write_str("Non-whitespace trailing characters"),
             Error::InvalidValueForType {
                 ref expected,
@@ -260,6 +266,19 @@ impl fmt::Display for Error {
 pub struct Position {
     pub line: usize,
     pub col: usize,
+}
+impl Position {
+    pub(crate) fn from_offset(src: &str, cursor: usize) -> Position {
+        let src = &src[..cursor];
+        let line = 1 + src.chars().filter(|&c| c == '\n').count();
+        let col = 1 + src
+            .rsplit('\n')
+            .next()
+            .expect("rsplit always yields at least one value")
+            .chars()
+            .count();
+        Position { line, col }
+    }
 }
 
 impl fmt::Display for Position {
@@ -399,6 +418,16 @@ impl From<SpannedError> for Error {
     }
 }
 
+impl SpannedError {
+    pub(crate) fn from_utf8_error(error: Utf8Error, src: &[u8]) -> Self {
+        let src = str::from_utf8(&src[..error.valid_up_to()]).expect("source is valid up to error");
+        Self {
+            code: error.into(),
+            position: Position::from_offset(src, error.valid_up_to()),
+        }
+    }
+}
+
 struct OneOf {
     alts: &'static [&'static str],
     none: &'static str,
@@ -432,13 +461,13 @@ struct Identifier<'a>(&'a str);
 
 impl<'a> fmt::Display for Identifier<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_empty() || !self.0.as_bytes().iter().copied().all(is_ident_raw_char) {
+        if self.0.is_empty() || !self.0.chars().all(is_ident_raw_char) {
             return write!(f, "{:?}_[invalid identifier]", self.0);
         }
 
-        let mut bytes = self.0.as_bytes().iter().copied();
+        let mut chars = self.0.chars();
 
-        if !bytes.next().map_or(false, is_ident_first_char) || !bytes.all(is_ident_other_char) {
+        if !chars.next().map_or(false, is_ident_first_char) || !chars.all(is_xid_continue) {
             write!(f, "`r#{}`", self.0)
         } else {
             write!(f, "`{}`", self.0)

@@ -10,7 +10,7 @@ use crate::{
     error::{Result, SpannedResult},
     extensions::Extensions,
     options::Options,
-    parse::{AnyNum, Bytes, ParsedStr, BASE64_ENGINE},
+    parse::{AnyNum, ParsedStr, Parser, BASE64_ENGINE},
 };
 
 mod id;
@@ -24,7 +24,7 @@ mod value;
 /// If you just want to simply deserialize a value,
 /// you can use the [`from_str`] convenience function.
 pub struct Deserializer<'de> {
-    bytes: Bytes<'de>,
+    parser: Parser<'de>,
     newtype_variant: bool,
     last_identifier: Option<&'de str>,
     recursion_limit: Option<usize>,
@@ -42,28 +42,31 @@ impl<'de> Deserializer<'de> {
     }
 
     pub fn from_str_with_options(input: &'de str, options: Options) -> SpannedResult<Self> {
-        Self::from_bytes_with_options(input.as_bytes(), options)
-    }
-
-    pub fn from_bytes_with_options(input: &'de [u8], options: Options) -> SpannedResult<Self> {
         let mut deserializer = Deserializer {
-            bytes: Bytes::new(input)?,
+            parser: Parser::new(input)?,
             newtype_variant: false,
             last_identifier: None,
             recursion_limit: options.recursion_limit,
         };
 
-        deserializer.bytes.exts |= options.default_extensions;
+        deserializer.parser.exts |= options.default_extensions;
 
         Ok(deserializer)
     }
 
+    pub fn from_bytes_with_options(input: &'de [u8], options: Options) -> SpannedResult<Self> {
+        Self::from_str_with_options(
+            str::from_utf8(input).map_err(|error| SpannedError::from_utf8_error(error, input))?,
+            options,
+        )
+    }
+
     pub fn remainder(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(self.bytes.bytes())
+        Cow::Borrowed(self.parser.src())
     }
 
     pub fn span_error(&self, code: Error) -> SpannedError {
-        self.bytes.span_error(code)
+        self.parser.span_error(code)
     }
 }
 
@@ -119,9 +122,9 @@ impl<'de> Deserializer<'de> {
     /// Check if the remaining bytes are whitespace only,
     /// otherwise return an error.
     pub fn end(&mut self) -> Result<()> {
-        self.bytes.skip_ws()?;
+        self.parser.skip_ws()?;
 
-        if self.bytes.bytes().is_empty() {
+        if self.parser.src().is_empty() {
             Ok(())
         } else {
             Err(Error::TrailingCharacters)
@@ -138,9 +141,9 @@ impl<'de> Deserializer<'de> {
         V: Visitor<'de>,
     {
         // Create a working copy
-        let mut bytes = self.bytes;
+        let mut bytes = self.parser.clone();
 
-        if bytes.consume("(") {
+        if bytes.consume_char('(') {
             bytes.skip_ws()?;
 
             if bytes.check_tuple_struct()? {
@@ -170,13 +173,13 @@ impl<'de> Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.newtype_variant || self.bytes.consume("(") {
+        if self.newtype_variant || self.parser.consume_char('(') {
             let old_newtype_variant = self.newtype_variant;
             self.newtype_variant = false;
 
             let value = guard_recursion! { self =>
                 visitor
-                    .visit_map(CommaSeparated::new(b')', self))
+                    .visit_map(CommaSeparated::new(')', self))
                     .map_err(|err| {
                         struct_error_name(
                             err,
@@ -189,9 +192,9 @@ impl<'de> Deserializer<'de> {
                     })?
             };
 
-            self.bytes.skip_ws()?;
+            self.parser.skip_ws()?;
 
-            if old_newtype_variant || self.bytes.consume(")") {
+            if old_newtype_variant || self.parser.consume_char(')') {
                 Ok(value)
             } else {
                 Err(Error::ExpectedStructLikeEnd)
@@ -215,39 +218,36 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         //  about the wrapped type - with `deserialize_any` we don't
         self.newtype_variant = false;
 
-        if self.bytes.consume_ident("true") {
+        if self.parser.consume_ident("true") {
             return visitor.visit_bool(true);
-        } else if self.bytes.consume_ident("false") {
+        } else if self.parser.consume_ident("false") {
             return visitor.visit_bool(false);
-        } else if self.bytes.check_ident("Some") {
+        } else if self.parser.check_ident("Some") {
             return self.deserialize_option(visitor);
-        } else if self.bytes.consume_ident("None") {
+        } else if self.parser.consume_ident("None") {
             return visitor.visit_none();
-        } else if self.bytes.consume("()") {
+        } else if self.parser.consume_str("()") {
             return visitor.visit_unit();
-        } else if self.bytes.consume_ident("inf") {
+        } else if self.parser.consume_ident("inf") {
             return visitor.visit_f64(std::f64::INFINITY);
-        } else if self.bytes.consume_ident("-inf") {
+        } else if self.parser.consume_ident("-inf") {
             return visitor.visit_f64(std::f64::NEG_INFINITY);
-        } else if self.bytes.consume_ident("NaN") {
+        } else if self.parser.consume_ident("NaN") {
             return visitor.visit_f64(std::f64::NAN);
         }
 
-        // `identifier` does not change state if it fails
-        let ident = self.bytes.identifier().ok();
-
-        if ident.is_some() {
-            self.bytes.skip_ws()?;
+        if self.parser.skip_ident() {
+            self.parser.skip_ws()?;
 
             return self.handle_any_struct(visitor);
         }
 
-        match self.bytes.peek_or_eof()? {
-            b'(' => self.handle_any_struct(visitor),
-            b'[' => self.deserialize_seq(visitor),
-            b'{' => self.deserialize_map(visitor),
-            b'0'..=b'9' | b'+' | b'-' => {
-                let any_num: AnyNum = self.bytes.any_num()?;
+        match self.parser.peek()? {
+            '(' => self.handle_any_struct(visitor),
+            '[' => self.deserialize_seq(visitor),
+            '{' => self.deserialize_map(visitor),
+            '0'..='9' | '+' | '-' => {
+                let any_num: AnyNum = self.parser.any_num()?;
 
                 match any_num {
                     AnyNum::F32(x) => visitor.visit_f32(x),
@@ -266,10 +266,10 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
                     AnyNum::U128(x) => visitor.visit_u128(x),
                 }
             }
-            b'.' => self.deserialize_f64(visitor),
-            b'"' | b'r' => self.deserialize_string(visitor),
-            b'\'' => self.deserialize_char(visitor),
-            other => Err(Error::UnexpectedByte(other as char)),
+            '.' => self.deserialize_f64(visitor),
+            '"' | 'r' => self.deserialize_string(visitor),
+            '\'' => self.deserialize_char(visitor),
+            other => Err(Error::UnexpectedChar(other)),
         }
     }
 
@@ -277,35 +277,35 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_bool(self.bytes.bool()?)
+        visitor.visit_bool(self.parser.bool()?)
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i8(self.bytes.signed_integer()?)
+        visitor.visit_i8(self.parser.signed_integer()?)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i16(self.bytes.signed_integer()?)
+        visitor.visit_i16(self.parser.signed_integer()?)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i32(self.bytes.signed_integer()?)
+        visitor.visit_i32(self.parser.signed_integer()?)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i64(self.bytes.signed_integer()?)
+        visitor.visit_i64(self.parser.signed_integer()?)
     }
 
     #[cfg(feature = "integer128")]
@@ -313,35 +313,35 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i128(self.bytes.signed_integer()?)
+        visitor.visit_i128(self.parser.signed_integer()?)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u8(self.bytes.unsigned_integer()?)
+        visitor.visit_u8(self.parser.unsigned_integer()?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u16(self.bytes.unsigned_integer()?)
+        visitor.visit_u16(self.parser.unsigned_integer()?)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u32(self.bytes.unsigned_integer()?)
+        visitor.visit_u32(self.parser.unsigned_integer()?)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u64(self.bytes.unsigned_integer()?)
+        visitor.visit_u64(self.parser.unsigned_integer()?)
     }
 
     #[cfg(feature = "integer128")]
@@ -349,35 +349,35 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u128(self.bytes.unsigned_integer()?)
+        visitor.visit_u128(self.parser.unsigned_integer()?)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_f32(self.bytes.float()?)
+        visitor.visit_f32(self.parser.float()?)
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_f64(self.bytes.float()?)
+        visitor.visit_f64(self.parser.float()?)
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_char(self.bytes.char()?)
+        visitor.visit_char(self.parser.char()?)
     }
 
     fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        match self.bytes.string()? {
+        match self.parser.string()? {
             ParsedStr::Allocated(s) => visitor.visit_string(s),
             ParsedStr::Slice(s) => visitor.visit_borrowed_str(s),
         }
@@ -402,7 +402,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         V: Visitor<'de>,
     {
         let res = {
-            let string = self.bytes.string()?;
+            let string = self.parser.string()?;
             let base64_str = match string {
                 ParsedStr::Allocated(ref s) => s.as_str(),
                 ParsedStr::Slice(s) => s,
@@ -420,24 +420,24 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.bytes.consume("None") {
+        if self.parser.consume_str("None") {
             visitor.visit_none()
-        } else if self.bytes.consume("Some") && {
-            self.bytes.skip_ws()?;
-            self.bytes.consume("(")
+        } else if self.parser.consume_str("Some") && {
+            self.parser.skip_ws()?;
+            self.parser.consume_char('(')
         } {
-            self.bytes.skip_ws()?;
+            self.parser.skip_ws()?;
 
             let v = guard_recursion! { self => visitor.visit_some(&mut *self)? };
 
-            self.bytes.comma()?;
+            self.parser.comma()?;
 
-            if self.bytes.consume(")") {
+            if self.parser.consume_char(')') {
                 Ok(v)
             } else {
                 Err(Error::ExpectedOptionEnd)
             }
-        } else if self.bytes.exts.contains(Extensions::IMPLICIT_SOME) {
+        } else if self.parser.exts.contains(Extensions::IMPLICIT_SOME) {
             guard_recursion! { self => visitor.visit_some(&mut *self) }
         } else {
             Err(Error::ExpectedOption)
@@ -449,7 +449,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.newtype_variant || self.bytes.consume("()") {
+        if self.newtype_variant || self.parser.consume_str("()") {
             self.newtype_variant = false;
 
             visitor.visit_unit()
@@ -462,7 +462,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.newtype_variant || self.bytes.consume_struct_name(name)? {
+        if self.newtype_variant || self.parser.consume_struct_name(name)? {
             self.newtype_variant = false;
 
             visitor.visit_unit()
@@ -476,36 +476,35 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         V: Visitor<'de>,
     {
         if name == crate::value::raw::RAW_VALUE_TOKEN {
-            let bytes_before = self.bytes.bytes();
-            self.bytes.skip_ws()?;
+            let src_before = self.parser.src();
+            self.parser.skip_ws()?;
             let _ignored = self.deserialize_ignored_any(serde::de::IgnoredAny)?;
-            self.bytes.skip_ws()?;
-            let bytes_after = self.bytes.bytes();
+            self.parser.skip_ws()?;
+            let src_after = self.parser.src();
 
-            let ron_bytes = &bytes_before[..bytes_before.len() - bytes_after.len()];
-            let ron_str = str::from_utf8(ron_bytes).map_err(Error::from)?;
+            let ron_str = &src_before[..src_before.len() - src_after.len()];
 
             return visitor
                 .visit_borrowed_str::<Error>(ron_str)
                 .map_err(|_| Error::ExpectedRawValue);
         }
 
-        if self.bytes.exts.contains(Extensions::UNWRAP_NEWTYPES) || self.newtype_variant {
+        if self.parser.exts.contains(Extensions::UNWRAP_NEWTYPES) || self.newtype_variant {
             self.newtype_variant = false;
 
             return guard_recursion! { self => visitor.visit_newtype_struct(&mut *self) };
         }
 
-        self.bytes.consume_struct_name(name)?;
+        self.parser.consume_struct_name(name)?;
 
-        self.bytes.skip_ws()?;
+        self.parser.skip_ws()?;
 
-        if self.bytes.consume("(") {
-            self.bytes.skip_ws()?;
+        if self.parser.consume_char('(') {
+            self.parser.skip_ws()?;
             let value = guard_recursion! { self => visitor.visit_newtype_struct(&mut *self)? };
-            self.bytes.comma()?;
+            self.parser.comma()?;
 
-            if self.bytes.consume(")") {
+            if self.parser.consume_char(')') {
                 Ok(value)
             } else {
                 Err(Error::ExpectedStructLikeEnd)
@@ -523,13 +522,13 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     {
         self.newtype_variant = false;
 
-        if self.bytes.consume("[") {
+        if self.parser.consume_char('[') {
             let value = guard_recursion! { self =>
-                visitor.visit_seq(CommaSeparated::new(b']', self))?
+                visitor.visit_seq(CommaSeparated::new(']', self))?
             };
-            self.bytes.skip_ws()?;
+            self.parser.skip_ws()?;
 
-            if self.bytes.consume("]") {
+            if self.parser.consume_char(']') {
                 Ok(value)
             } else {
                 Err(Error::ExpectedArrayEnd)
@@ -543,16 +542,16 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.newtype_variant || self.bytes.consume("(") {
+        if self.newtype_variant || self.parser.consume_char('(') {
             let old_newtype_variant = self.newtype_variant;
             self.newtype_variant = false;
 
             let value = guard_recursion! { self =>
-                visitor.visit_seq(CommaSeparated::new(b')', self))?
+                visitor.visit_seq(CommaSeparated::new(')', self))?
             };
-            self.bytes.skip_ws()?;
+            self.parser.skip_ws()?;
 
-            if old_newtype_variant || self.bytes.consume(")") {
+            if old_newtype_variant || self.parser.consume_char(')') {
                 Ok(value)
             } else {
                 Err(Error::ExpectedStructLikeEnd)
@@ -572,7 +571,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         V: Visitor<'de>,
     {
         if !self.newtype_variant {
-            self.bytes.consume_struct_name(name)?;
+            self.parser.consume_struct_name(name)?;
         }
 
         self.deserialize_tuple(len, visitor).map_err(|e| match e {
@@ -587,13 +586,13 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     {
         self.newtype_variant = false;
 
-        if self.bytes.consume("{") {
+        if self.parser.consume_char('{') {
             let value = guard_recursion! { self =>
-                visitor.visit_map(CommaSeparated::new(b'}', self))?
+                visitor.visit_map(CommaSeparated::new('}', self))?
             };
-            self.bytes.skip_ws()?;
+            self.parser.skip_ws()?;
 
-            if self.bytes.consume("}") {
+            if self.parser.consume_char('}') {
                 Ok(value)
             } else {
                 Err(Error::ExpectedMapEnd)
@@ -613,10 +612,10 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         V: Visitor<'de>,
     {
         if !self.newtype_variant {
-            self.bytes.consume_struct_name(name)?;
+            self.parser.consume_struct_name(name)?;
         }
 
-        self.bytes.skip_ws()?;
+        self.parser.skip_ws()?;
 
         self.handle_struct_after_name(name, visitor)
     }
@@ -651,7 +650,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let identifier = str::from_utf8(self.bytes.identifier()?).map_err(Error::from)?;
+        let identifier = self.parser.identifier()?;
 
         self.last_identifier = Some(identifier);
 
@@ -668,12 +667,12 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 
 struct CommaSeparated<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
-    terminator: u8,
+    terminator: char,
     had_comma: bool,
 }
 
 impl<'a, 'de> CommaSeparated<'a, 'de> {
-    fn new(terminator: u8, de: &'a mut Deserializer<'de>) -> Self {
+    fn new(terminator: char, de: &'a mut Deserializer<'de>) -> Self {
         CommaSeparated {
             de,
             terminator,
@@ -682,12 +681,9 @@ impl<'a, 'de> CommaSeparated<'a, 'de> {
     }
 
     fn has_element(&mut self) -> Result<bool> {
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
-        match (
-            self.had_comma,
-            self.de.bytes.peek_or_eof()? != self.terminator,
-        ) {
+        match (self.had_comma, self.de.parser.peek()? != self.terminator) {
             // Trailing comma, maybe has a next element
             (true, has_element) => Ok(has_element),
             // No trailing comma but terminator
@@ -708,7 +704,7 @@ impl<'de, 'a> de::SeqAccess<'de> for CommaSeparated<'a, 'de> {
         if self.has_element()? {
             let res = guard_recursion! { self.de => seed.deserialize(&mut *self.de)? };
 
-            self.had_comma = self.de.bytes.comma()?;
+            self.had_comma = self.de.parser.comma()?;
 
             Ok(Some(res))
         } else {
@@ -725,7 +721,7 @@ impl<'de, 'a> de::MapAccess<'de> for CommaSeparated<'a, 'de> {
         K: DeserializeSeed<'de>,
     {
         if self.has_element()? {
-            if self.terminator == b')' {
+            if self.terminator == ')' {
                 guard_recursion! { self.de =>
                     seed.deserialize(&mut IdDeserializer::new(&mut *self.de)).map(Some)
                 }
@@ -741,16 +737,16 @@ impl<'de, 'a> de::MapAccess<'de> for CommaSeparated<'a, 'de> {
     where
         V: DeserializeSeed<'de>,
     {
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
-        if self.de.bytes.consume(":") {
-            self.de.bytes.skip_ws()?;
+        if self.de.parser.consume_char(':') {
+            self.de.parser.skip_ws()?;
 
             let res = guard_recursion! { self.de =>
                 seed.deserialize(&mut TagDeserializer::new(&mut *self.de))?
             };
 
-            self.had_comma = self.de.bytes.comma()?;
+            self.had_comma = self.de.parser.comma()?;
 
             Ok(res)
         } else {
@@ -777,7 +773,7 @@ impl<'de, 'a> de::EnumAccess<'de> for Enum<'a, 'de> {
     where
         V: DeserializeSeed<'de>,
     {
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
         let value = guard_recursion! { self.de => seed.deserialize(&mut *self.de)? };
 
@@ -798,14 +794,14 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
     {
         let newtype_variant = self.de.last_identifier;
 
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
-        if self.de.bytes.consume("(") {
-            self.de.bytes.skip_ws()?;
+        if self.de.parser.consume_char('(') {
+            self.de.parser.skip_ws()?;
 
             self.de.newtype_variant = self
                 .de
-                .bytes
+                .parser
                 .exts
                 .contains(Extensions::UNWRAP_VARIANT_NEWTYPES);
 
@@ -817,9 +813,9 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
 
             self.de.newtype_variant = false;
 
-            self.de.bytes.comma()?;
+            self.de.parser.comma()?;
 
-            if self.de.bytes.consume(")") {
+            if self.de.parser.consume_char(')') {
                 Ok(val)
             } else {
                 Err(Error::ExpectedStructLikeEnd)
@@ -833,7 +829,7 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
     where
         V: Visitor<'de>,
     {
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
         self.de.deserialize_tuple(len, visitor)
     }
@@ -844,7 +840,7 @@ impl<'de, 'a> de::VariantAccess<'de> for Enum<'a, 'de> {
     {
         let struct_variant = self.de.last_identifier;
 
-        self.de.bytes.skip_ws()?;
+        self.de.parser.skip_ws()?;
 
         self.de
             .handle_struct_after_name("", visitor)
